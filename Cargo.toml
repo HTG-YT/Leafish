@@ -75,3 +75,12 @@ version = "0"
 #[dependencies.std_or_web]
 #path = "./std_or_web"
 #version = "0"
+
+[target.i686-linux-android.dependencies]
+openssl = { version = "*", features = ["vendored"] }
+
+[target.armv7a-linux-android.dependencies]
+openssl = { version = "*", features = ["vendored"] }
+
+[target.aarch64-linux-android.dependencies]
+openssl = { version = "*", features = ["vendored"] }
