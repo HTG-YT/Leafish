@@ -1681,3 +1681,23 @@ impl TextBox {
         }
     }
 }
+
+element! {
+    ref DropdownRef
+    pub struct Dropdown {
+        pub width: f64,
+        pub height: f64,
+    }
+    builder DropdownBuilder {
+        noset width: f64 = |b| b.width.expect("Missing required field width"),
+        noset height: f64 = |b| b.height.expect("Missing required field height"),
+    }
+}
+
+impl DropdownBuilder {
+    pub fn size(mut self, width: f64, height: f64) -> Self {
+        self.width = Some(width);
+        self.height = Some(height);
+        self
+    }
+}
