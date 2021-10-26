@@ -36,6 +36,16 @@ pub struct AccountNew {
     pub auth_kind: AccountAuthKind
 }
 
+impl AccountNew {
+    pub fn new(name: String, uuid: Option<String>, auth_kind: AccountAuthKind) -> Self {
+        Self {
+            name,
+            uuid,
+            auth_kind
+        }
+    }
+}
+
 impl Account {
     pub fn new(name: String, uuid: Option<String>, account_type: AccountType) -> Self {
         Account {
