@@ -1,6 +1,7 @@
 use dashmap::DashMap;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::sync::Arc;
 
 pub trait AccountImpl {
@@ -26,6 +27,13 @@ pub struct Account {
     pub verification_tokens: Vec<String>, // this represents the verification tokens used to verify the account, such as hashed passwords, actual tokens, etc
     pub head_img_data: Option<Vec<u8>>,
     pub account_type: AccountType,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AccountNew {
+    pub name: String,
+    pub uuid: Option<String>,
+    pub auth_kind: AccountAuthKind
 }
 
 impl Account {
@@ -114,4 +122,13 @@ pub enum AccountType {
     Microsoft,
     Custom(String), // Not implemented yet, this will enable us to support other auth services without implementing every single one specifically
     None,           // aka. unverified or "offline account" (for offline mode servers)
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Hash, Clone)]
+pub enum AccountAuthKind {
+    Mojang {
+        auth_token: String
+    },
+    Microsoft,
+    Offline
 }
