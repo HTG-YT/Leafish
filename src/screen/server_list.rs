@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::format;
-use crate::format::{Component, TextComponent};
+use crate::format::{Component, ComponentType};
 use crate::paths;
 use crate::protocol;
 use crate::render;
@@ -116,7 +116,7 @@ impl ServerList {
 
     fn reload_server_list(
         &mut self,
-        renderer: &mut render::Renderer,
+        renderer: Arc<render::Renderer>,
         ui_container: &mut ui::Container,
     ) {
         let elements = self.elements.as_mut().unwrap();
@@ -172,8 +172,8 @@ impl ServerList {
                     if let Err(error) = result {
                         game.screen_sys
                             .clone()
-                            .add_screen(Box::new(ServerList::new(Some(Component::Text(
-                                TextComponent::new(&*error.to_string()),
+                            .add_screen(Box::new(ServerList::new(Some(Component::new(
+                                ComponentType::new(&error.to_string(), None),
                             )))));
                     } else {
                         game.screen_sys
@@ -215,14 +215,14 @@ impl ServerList {
 
             // Server's message of the day
             let motd = ui::FormattedBuilder::new()
-                .text(Component::Text(TextComponent::new("Connecting...")))
+                .text(Component::new(ComponentType::new("Connecting...", None)))
                 .position(100.0, 23.0)
                 .max_width(700.0 - (90.0 + 10.0 + 5.0))
                 .attach(&mut *back.borrow_mut());
 
             // Version information
             let version = ui::FormattedBuilder::new()
-                .text(Component::Text(TextComponent::new("")))
+                .text(Component::new(ComponentType::new("", None)))
                 .position(100.0, 5.0)
                 .max_width(700.0 - (90.0 + 10.0 + 5.0))
                 .alignment(ui::VAttach::Bottom, ui::HAttach::Left)
@@ -315,8 +315,7 @@ impl ServerList {
                     .and_then(|conn| conn.do_status())
                 {
                     Ok(res) => {
-                        let mut desc = res.0.description;
-                        format::convert_legacy(&mut desc);
+                        let desc = res.0.description;
                         let favicon = if let Some(icon) = res.0.favicon {
                             let data_base64 = &icon["data:image/png;base64,".len()..];
                             let data_base64: String =
@@ -340,10 +339,9 @@ impl ServerList {
                     }
                     Err(err) => {
                         let e = format!("{}", err);
-                        let mut msg = TextComponent::new(&e);
-                        msg.modifier.color = Some(format::Color::Red);
+                        let msg = ComponentType::new(&e, Some(format::Color::Red));
                         let _ = send.send(PingInfo {
-                            motd: Component::Text(msg),
+                            motd: Component::new(msg),
                             ping: Duration::new(99999, 0),
                             exists: false,
                             online: 0,
@@ -384,7 +382,7 @@ impl ServerList {
         serde_json::to_writer_pretty(&mut out, &servers_info).unwrap();
     }
 
-    fn init_list(&mut self, renderer: &mut render::Renderer, ui_container: &mut ui::Container) {
+    fn init_list(&mut self, renderer: Arc<render::Renderer>, ui_container: &mut ui::Container) {
         let logo = ui::logo::Logo::new(renderer.resources.clone(), ui_container);
 
         // Refresh the server list
@@ -464,13 +462,19 @@ impl ServerList {
 
         // If we are kicked from a server display the reason
         let disconnected = if let Some(ref disconnect_reason) = self.disconnect_reason {
-            let (width, height) =
-                ui::Formatted::compute_size(renderer, disconnect_reason, 600.0, 1.0, 1.0, 1.0);
+            let (width, height) = ui::Formatted::compute_size(
+                renderer.clone(),
+                disconnect_reason,
+                600.0,
+                1.0,
+                1.0,
+                1.0,
+            );
             let background = ui::ImageBuilder::new()
                 .texture("leafish:solid")
                 .position(0.0, 3.0)
                 .size(
-                    width.max(renderer.ui.size_of_string("Disconnected")) + 4.0,
+                    width.max(renderer.ui.lock().size_of_string("Disconnected")) + 4.0,
                     height + 4.0 + 16.0,
                 )
                 .colour((0, 0, 0, 100))
@@ -512,7 +516,7 @@ impl super::Screen for ServerList {
     fn on_active(
         &mut self,
         _screen_sys: &ScreenSystem,
-        renderer: &mut render::Renderer,
+        renderer: Arc<render::Renderer>,
         ui_container: &mut ui::Container,
     ) {
         self.init_list(renderer, ui_container);
@@ -522,7 +526,7 @@ impl super::Screen for ServerList {
     fn on_deactive(
         &mut self,
         _screen_sys: &ScreenSystem,
-        renderer: &mut render::Renderer,
+        renderer: Arc<render::Renderer>,
         _ui_container: &mut ui::Container,
     ) {
         // Clean up
@@ -541,16 +545,16 @@ impl super::Screen for ServerList {
     fn tick(
         &mut self,
         _screen_sys: &ScreenSystem,
-        renderer: &mut render::Renderer,
+        renderer: Arc<render::Renderer>,
         ui_container: &mut ui::Container,
         delta: f64,
     ) {
         if *self.needs_reload.borrow() {
-            self.reload_server_list(renderer, ui_container);
+            self.reload_server_list(renderer.clone(), ui_container);
         }
         let elements = self.elements.as_mut().unwrap();
 
-        elements.logo.tick(renderer);
+        elements.logo.tick(renderer.clone());
 
         for s in &mut elements.servers {
             // Animate the entries
@@ -614,11 +618,9 @@ impl super::Screen for ServerList {
                             } else {
                                 &res.protocol_name
                             };
-                            let mut txt = TextComponent::new(st);
-                            txt.modifier.color = Some(format::Color::Yellow);
-                            let mut msg = Component::Text(txt);
-                            format::convert_legacy(&mut msg);
-                            s.version.borrow_mut().set_text(msg);
+                            let msg_component =
+                                Component::new(ComponentType::new(st, Some(format::Color::Yellow)));
+                            s.version.borrow_mut().set_text(msg_component);
                         }
                         if let Some(favicon) = res.favicon {
                             let name: String = std::iter::repeat(())
@@ -636,9 +638,12 @@ impl super::Screen for ServerList {
                     }
                     Err(TryRecvError::Disconnected) => {
                         s.done_ping = true;
-                        let mut txt = TextComponent::new("Channel dropped");
-                        txt.modifier.color = Some(format::Color::Red);
-                        s.motd.borrow_mut().set_text(Component::Text(txt));
+                        s.motd
+                            .borrow_mut()
+                            .set_text(Component::new(ComponentType::new(
+                                "Channel dropped",
+                                Some(format::Color::Red),
+                            )));
                     }
                     _ => {}
                 }
@@ -672,11 +677,11 @@ impl super::Screen for ServerList {
     fn on_resize(
         &mut self,
         screen_sys: &ScreenSystem,
-        renderer: &mut Renderer,
+        renderer: Arc<Renderer>,
         ui_container: &mut Container,
     ) {
         // TODO: Don't ping the servers on resize!
-        self.on_deactive(screen_sys, renderer, ui_container);
+        self.on_deactive(screen_sys, renderer.clone(), ui_container);
         self.on_active(screen_sys, renderer, ui_container);
     }
 

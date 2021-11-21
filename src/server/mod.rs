@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::ecs::Manager;
 use crate::entity;
-use crate::entity::player::create_local;
-use crate::entity::EntityType;
+use crate::entity::player::{create_local, PlayerModel, PlayerMovement};
+use crate::entity::{EntityType, GameInfo, Gravity, TargetPosition, TargetRotation};
 use crate::format;
 use crate::inventory::material::versions::to_material;
 use crate::inventory::{inventory_from_type, Inventory, InventoryContext, InventoryType, Item};
+use crate::particle::block_break_effect::{BlockBreakEffect, BlockEffectData};
+use crate::particle::ParticleType;
 use crate::protocol::{self, forge, mapped_packet, packet};
 use crate::render;
 use crate::render::hud::HudContext;
@@ -33,11 +36,15 @@ use crate::types::GameMode;
 use crate::world;
 use crate::world::{CPos, LightData, LightUpdate};
 use crate::{ecs, Game};
+use atomic_float::AtomicF64;
+use bevy_ecs::prelude::{Entity, Stage, SystemStage};
 use cgmath::prelude::*;
+use cgmath::Vector3;
 use crossbeam_channel::unbounded;
 use crossbeam_channel::{Receiver, Sender};
+use dashmap::DashMap;
 use instant::{Duration, Instant};
-use leafish_protocol::format::{Component, TextComponent};
+use leafish_protocol::format::Component;
 use leafish_protocol::item::Stack;
 use leafish_protocol::protocol::login::Account;
 use leafish_protocol::protocol::mapped_packet::MappablePacket;
@@ -54,7 +61,7 @@ use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 use std::io::Cursor;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -78,7 +85,7 @@ struct WorldData {
 
 impl Default for WorldData {
     fn default() -> Self {
-        WorldData {
+        Self {
             world_age: 0,
             world_time: 0.0,
             world_time_target: 0.0,
@@ -103,23 +110,14 @@ pub struct Server {
     version: AtomicUsize,
 
     // Entity accessors
-    game_info: ecs::Key<entity::GameInfo>,
-    player_movement: ecs::Key<entity::player::PlayerMovement>,
-    gravity: ecs::Key<entity::Gravity>,
-    position: ecs::Key<entity::Position>,
-    target_position: ecs::Key<entity::TargetPosition>,
-    velocity: ecs::Key<entity::Velocity>,
-    gamemode: ecs::Key<GameMode>,
-    pub rotation: ecs::Key<entity::Rotation>,
-    target_rotation: ecs::Key<entity::TargetRotation>,
     block_break_info: Mutex<BlockBreakInfo>,
     //
-    pub player: Arc<RwLock<Option<ecs::Entity>>>,
-    entity_map: Arc<RwLock<HashMap<i32, ecs::Entity, BuildHasherDefault<FNVHash>>>>,
+    pub player: Arc<RwLock<Option<(i32, Entity)>>>,
+    entity_map: Arc<RwLock<HashMap<i32, Entity, BuildHasherDefault<FNVHash>>>>,
     players: Arc<RwLock<HashMap<protocol::UUID, PlayerInfo, BuildHasherDefault<FNVHash>>>>,
 
-    tick_timer: RwLock<f64>,
-    entity_tick_timer: RwLock<f64>,
+    tick_timer: AtomicF64,
+    entity_tick_timer: AtomicF64,
     pub received_chat_at: Arc<RwLock<Option<Instant>>>,
 
     sun_model: RwLock<Option<sun::SunModel>>,
@@ -128,15 +126,16 @@ pub struct Server {
     pub render_list_computer_notify: Receiver<bool>,
     pub hud_context: Arc<RwLock<HudContext>>,
     pub inventory_context: Arc<RwLock<InventoryContext>>,
-    fps: RwLock<u32>,
+    fps: AtomicU32,
     fps_start: RwLock<u128>,
-    pub dead: RwLock<bool>,
-    just_died: RwLock<bool>,
+    pub dead: AtomicBool,
+    just_died: AtomicBool,
     last_chat_open: AtomicBool,
     pub chat_open: AtomicBool,
     pub chat_ctx: Arc<ChatContext>,
     screen_sys: Arc<ScreenSystem>,
-    renderer: Arc<RwLock<Renderer>>,
+    renderer: Arc<Renderer>,
+    active_block_break_anims: Arc<DashMap<i32, Entity>>,
 }
 
 #[derive(Debug)]
@@ -148,6 +147,7 @@ pub struct BlockBreakInfo {
     delay: u8,
     active: bool,
     pressed: bool,
+    effect_id: Option<Entity>,
 }
 
 #[derive(Debug)]
@@ -169,7 +169,7 @@ impl Server {
         protocol_version: i32,
         forge_mods: Vec<forge::ForgeMod>,
         fml_network_version: Option<i64>,
-        renderer: Arc<RwLock<Renderer>>,
+        renderer: Arc<Renderer>,
         hud_context: Arc<RwLock<HudContext>>,
         screen_sys: Arc<ScreenSystem>,
     ) -> Result<Arc<Server>, protocol::Error> {
@@ -391,7 +391,7 @@ impl Server {
         forge_mods: Vec<forge::ForgeMod>,
         uuid: protocol::UUID,
         resources: Arc<RwLock<resources::Manager>>,
-        renderer: Arc<RwLock<Renderer>>,
+        renderer: Arc<Renderer>,
         hud_context: Arc<RwLock<HudContext>>,
         screen_sys: Arc<ScreenSystem>,
     ) -> Arc<Server> {
@@ -515,11 +515,13 @@ impl Server {
                             if let Some(entity) =
                                 server.entity_map.clone().read().get(&look.entity_id)
                             {
-                                let rotation = server
-                                    .entities
-                                    .clone()
-                                    .write()
-                                    .get_component_mut(*entity, server.target_rotation)
+                                let entities = server.entities.clone();
+                                let mut entities = entities.write();
+                                let mut rotation = entities
+                                    .world
+                                    .get_entity_mut(*entity)
+                                    .unwrap()
+                                    .get_mut::<TargetRotation>()
                                     .unwrap();
                                 rotation.yaw = -(look.head_yaw as f64 / 256.0) * PI * 2.0;
                             }
@@ -736,6 +738,47 @@ impl Server {
                                 );
                             }*/
                         }
+                        MappedPacket::BlockBreakAnimation(block_break) => {
+                            if block_break.stage >= 10 || block_break.stage < 1 {
+                                if let Some(break_impl) = server
+                                    .active_block_break_anims
+                                    .remove(&block_break.entity_id)
+                                {
+                                    server.entities.clone().write().world.despawn(break_impl.1);
+                                }
+                            } else if let Some(anim_ent) = server
+                                .active_block_break_anims
+                                .clone()
+                                .get(&block_break.entity_id)
+                            {
+                                let entities = server.entities.clone();
+                                let mut entities = entities.write();
+                                let mut anim =
+                                    entities.world.get_entity_mut(*anim_ent.value()).unwrap();
+                                let effect = anim.get_mut::<BlockBreakEffect>();
+                                if let Some(mut effect) = effect {
+                                    effect.update(block_break.stage);
+                                }
+                            } else {
+                                let entities = server.entities.clone();
+                                let mut entities = entities.write();
+                                let mut entity = entities.world.spawn();
+                                entity.insert(BlockEffectData {
+                                    position: Vector3::new(
+                                        block_break.location.x as f64,
+                                        block_break.location.y as f64,
+                                        block_break.location.z as f64,
+                                    ),
+                                    status: block_break.stage,
+                                });
+                                let entity = entity.id();
+                                ParticleType::BlockBreak.create_particle(&mut entities, entity);
+                                server
+                                    .active_block_break_anims
+                                    .clone()
+                                    .insert(block_break.entity_id, entity);
+                            }
+                        }
                         _ => {
                             // debug!("other packet!");
                         }
@@ -753,10 +796,10 @@ impl Server {
                                 .clone()
                                 .write()
                                 .disconnect_reason
-                                .replace(Component::Text(TextComponent::new(&*format!(
-                                    "An error occurred while reading a packet: {}",
-                                    err
-                                ))));
+                                .replace(Component::new(format::ComponentType::new(
+                                    &*format!("An error occurred while reading a packet: {}", err),
+                                    None,
+                                )));
                         }
                     }
                 }
@@ -797,12 +840,12 @@ impl Server {
 
     fn spawn_render_list_computer(
         server: Arc<Mutex<Option<Arc<Server>>>>,
-        renderer: Arc<RwLock<Renderer>>,
+        renderer: Arc<Renderer>,
     ) -> (Sender<bool>, Receiver<bool>) {
         let (tx, rx) = unbounded();
         let (etx, erx) = unbounded();
         thread::spawn(move || loop {
-            let _: bool = rx.recv().unwrap();
+            let _ = rx.recv().unwrap();
             let server = server.clone().lock().as_ref().unwrap().clone();
             let world = server.world.clone();
             world.compute_render_list(renderer.clone());
@@ -823,24 +866,38 @@ impl Server {
         render_list_computer_notify: Receiver<bool>,
         hud_context: Arc<RwLock<HudContext>>,
         screen_sys: Arc<ScreenSystem>,
-        renderer: Arc<RwLock<Renderer>>,
+        renderer: Arc<Renderer>,
     ) -> Server {
-        let mut entities = ecs::Manager::new();
-        entity::add_systems(&mut entities);
-
-        let world_entity = entities.get_world();
-        let game_info = entities.get_key();
-        entities.add_component(world_entity, game_info, entity::GameInfo::new());
+        let world = Arc::new(world::World::new(protocol_version, light_updater));
+        let mut entities = Manager::default();
+        let mut parallel = SystemStage::parallel();
+        let mut sync = SystemStage::single_threaded();
+        let mut entity_sched = SystemStage::single_threaded();
+        entities.world.insert_resource(entity::GameInfo::new());
+        entities.world.insert_resource(world.clone());
+        entities.world.insert_resource(renderer.clone());
+        entities.world.insert_resource(screen_sys.clone());
+        entity::add_systems(&mut entities, &mut parallel, &mut sync, &mut entity_sched);
+        entities
+            .schedule
+            .clone()
+            .write()
+            .add_stage("parallel", parallel)
+            .add_stage_after("parallel", "sync", sync);
+        entities
+            .entity_schedule
+            .clone()
+            .write()
+            .add_stage("entity", entity_sched);
 
         let version = Version::from_id(protocol_version as u32);
         let inventory_context = Arc::new(RwLock::new(InventoryContext::new(
             version,
-            &renderer.read(),
+            renderer.clone(),
             hud_context.clone(),
         )));
         hud_context.write().player_inventory =
             Some(inventory_context.read().player_inventory.clone());
-        EntityType::init(&mut entities);
 
         let version = resources.read().version();
         Server {
@@ -851,21 +908,11 @@ impl Server {
             forge_mods,
             disconnect_data: Arc::new(RwLock::new(DisconnectData::default())),
 
-            world: Arc::new(world::World::new(protocol_version, light_updater)),
+            world,
             world_data: Arc::new(RwLock::new(WorldData::default())),
             version: AtomicUsize::new(version),
             resources,
 
-            // Entity accessors
-            game_info,
-            player_movement: entities.get_key(),
-            gravity: entities.get_key(),
-            position: entities.get_key(),
-            target_position: entities.get_key(),
-            velocity: entities.get_key(),
-            gamemode: entities.get_key(),
-            rotation: entities.get_key(),
-            target_rotation: entities.get_key(),
             //
             entities: Arc::new(RwLock::new(entities)),
             player: Arc::new(RwLock::new(None)),
@@ -876,8 +923,8 @@ impl Server {
                 BuildHasherDefault::default(),
             ))),
 
-            tick_timer: RwLock::from(0.0),
-            entity_tick_timer: RwLock::from(0.0),
+            tick_timer: AtomicF64::new(0.0),
+            entity_tick_timer: AtomicF64::new(0.0),
             received_chat_at: Arc::new(RwLock::new(None)),
             sun_model: RwLock::new(None),
 
@@ -886,10 +933,10 @@ impl Server {
             render_list_computer_notify,
             hud_context,
             inventory_context,
-            fps: RwLock::new(0),
+            fps: AtomicU32::new(0),
             fps_start: RwLock::new(0),
-            dead: RwLock::new(false),
-            just_died: RwLock::new(false),
+            dead: AtomicBool::new(false),
+            just_died: AtomicBool::new(false),
             block_break_info: Mutex::new(BlockBreakInfo {
                 break_position: Default::default(),
                 break_face: BlockDirection::Invalid,
@@ -898,12 +945,14 @@ impl Server {
                 delay: 0,
                 active: false,
                 pressed: false,
+                effect_id: None,
             }),
             last_chat_open: AtomicBool::new(false),
             chat_open: AtomicBool::new(false),
             chat_ctx: Arc::new(ChatContext::new()),
             screen_sys,
             renderer,
+            active_block_break_anims: Arc::new(Default::default()),
         }
     }
 
@@ -911,7 +960,13 @@ impl Server {
         self.conn.clone().write().take().unwrap().close();
         self.disconnect_data.clone().write().disconnect_reason = reason;
         if let Some(player) = self.player.clone().write().take() {
-            self.entities.clone().write().remove_entity(player);
+            // TODO: Is this even required if we have the despawn code below?
+            self.entities.clone().write().world.despawn(player.1);
+        }
+        for entity in &*self.entity_map.clone().write() {
+            if self.entities.read().world.get_entity(*entity.1).is_some() {
+                self.entities.clone().write().world.despawn(*entity.1);
+            }
         }
         self.disconnect_data.clone().write().just_disconnected = true;
     }
@@ -920,18 +975,19 @@ impl Server {
         return self.conn.clone().read().is_some();
     }
 
-    pub fn tick(&self, renderer: Arc<RwLock<render::Renderer>>, delta: f64, game: &mut Game) {
+    pub fn tick(&self, renderer: Arc<render::Renderer>, delta: f64, game: &mut Game) {
         let start = SystemTime::now();
         let time = start.duration_since(UNIX_EPOCH).unwrap().as_millis();
         if *self.fps_start.read() + 1000 < time {
             self.hud_context
                 .clone()
                 .write()
-                .update_fps(*self.fps.read());
+                .update_fps(self.fps.load(Ordering::Acquire));
             *self.fps_start.write() = time;
-            *self.fps.write() = 0;
+            self.fps.store(0, Ordering::Release);
         } else {
-            *self.fps.write() += 1;
+            self.fps
+                .store(self.fps.load(Ordering::Acquire) + 1, Ordering::Release);
         }
         let chat_open = self.chat_open.load(Ordering::Acquire);
         if chat_open != self.last_chat_open.load(Ordering::Acquire) {
@@ -950,46 +1006,53 @@ impl Server {
             self.world.clone().flag_dirty_all();
         }
         {
-            let renderer = &mut renderer.write();
             // TODO: Check if the world type actually needs a sun
             if self.sun_model.read().is_none() {
-                self.sun_model.write().replace(sun::SunModel::new(renderer));
+                self.sun_model
+                    .write()
+                    .replace(sun::SunModel::new(renderer.clone()));
             }
 
             // Copy to camera
             if let Some(player) = *self.player.clone().read() {
-                let position = self
-                    .entities
-                    .clone()
-                    .read()
-                    .get_component(player, self.position)
-                    .unwrap(); // TODO: This panicked, check why!
-                let rotation = self
-                    .entities
-                    .clone()
-                    .read()
-                    .get_component(player, self.rotation)
+                let entities = self.entities.read();
+                let position = entities
+                    .world
+                    .get_entity(player.1)
+                    .unwrap()
+                    .get::<crate::entity::Position>()
                     .unwrap();
-                renderer.camera.pos = cgmath::Point3::from_vec(
+                let rotation = entities
+                    .world
+                    .get_entity(player.1)
+                    .unwrap()
+                    .get::<crate::entity::Rotation>()
+                    .unwrap();
+                renderer.camera.lock().pos = cgmath::Point3::from_vec(
                     position.position + cgmath::Vector3::new(0.0, 1.62, 0.0),
                 );
-                renderer.camera.yaw = rotation.yaw;
-                renderer.camera.pitch = rotation.pitch;
+                renderer.camera.lock().yaw = rotation.yaw;
+                renderer.camera.lock().pitch = rotation.pitch;
             }
-            self.entity_tick(renderer, delta, game.focused, *self.dead.read());
         }
+        self.entity_tick(delta, game.focused, self.dead.load(Ordering::Acquire));
 
-        *self.tick_timer.write() += delta;
-        while *self.tick_timer.read() >= 3.0 && self.is_connected() {
+        self.tick_timer.store(
+            self.tick_timer.load(Ordering::Acquire) + delta,
+            Ordering::Release,
+        );
+        while self.tick_timer.load(Ordering::Acquire) >= 3.0 && self.is_connected() {
             self.minecraft_tick(game);
-            *self.tick_timer.write() -= 3.0;
+            self.tick_timer.store(
+                self.tick_timer.load(Ordering::Acquire) - 3.0,
+                Ordering::Release,
+            );
         }
-        let renderer = &mut renderer.write();
 
-        self.update_time(renderer, delta);
+        self.update_time(renderer.clone(), delta);
         if let Some(sun_model) = self.sun_model.write().as_mut() {
             sun_model.tick(
-                renderer,
+                renderer.clone(),
                 self.world_data.clone().read().world_time,
                 self.world_data.clone().read().world_age,
             );
@@ -998,8 +1061,8 @@ impl Server {
         world.tick(&mut self.entities.clone().write());
 
         if self.player.clone().read().is_some() {
-            if *self.just_died.read() {
-                *self.just_died.write() = false;
+            if self.just_died.load(Ordering::Acquire) {
+                self.just_died.store(false, Ordering::Release);
                 game.screen_sys.close_closable_screens();
                 game.screen_sys
                     .clone()
@@ -1009,63 +1072,65 @@ impl Server {
             if let Some((pos, bl, _, _)) = target::trace_ray(
                 &world,
                 4.0,
-                renderer.camera.pos.to_vec(),
-                renderer.view_vector.cast().unwrap(),
+                renderer.camera.lock().pos.to_vec(),
+                renderer.view_vector.lock().cast().unwrap(),
                 target::test_block,
             ) {
-                self.target_info.clone().write().update(renderer, pos, bl);
+                self.target_info
+                    .clone()
+                    .write()
+                    .update(renderer.clone(), pos, bl);
             } else {
-                self.target_info.clone().write().clear(renderer);
+                self.target_info.clone().write().clear();
             }
         } else {
-            self.target_info.clone().write().clear(renderer);
+            self.target_info.clone().write().clear();
         }
     }
 
-    fn entity_tick(&self, renderer: &mut render::Renderer, delta: f64, focused: bool, dead: bool) {
-        let world_entity = self.entities.clone().read().get_world();
-        // Update the game's state for entities to read
-        self.entities
-            .clone()
-            .write()
-            .get_component_mut(world_entity, self.game_info)
-            .unwrap()
-            .delta = delta;
+    fn entity_tick(&self, delta: f64, _focused: bool, _dead: bool) {
+        let entities = self.entities.clone();
+        let mut entities = entities.write();
+        {
+            let mut game_info = entities.world.get_resource_mut::<GameInfo>().unwrap();
+            // Update the game's state for entities to read
+            game_info.delta = delta;
+        }
 
         if self.is_connected() || self.disconnect_data.clone().read().just_disconnected {
             // Allow an extra tick when disconnected to clean up
             self.disconnect_data.clone().write().just_disconnected = false;
-            *self.entity_tick_timer.write() += delta;
-            while *self.entity_tick_timer.read() >= 3.0 {
-                let world = self.world.clone();
-                self.entities
-                    .clone()
-                    .write()
-                    .tick(&world, renderer, focused, dead);
-                *self.entity_tick_timer.write() -= 3.0;
+            self.entity_tick_timer.store(
+                self.entity_tick_timer.load(Ordering::Acquire) + delta,
+                Ordering::Release,
+            );
+            entities.world.clear_trackers();
+            let entity_schedule = entities.entity_schedule.clone();
+            while self.entity_tick_timer.load(Ordering::Acquire) >= 3.0 {
+                entity_schedule.clone().write().run(&mut entities.world);
+                self.entity_tick_timer.store(
+                    self.entity_tick_timer.load(Ordering::Acquire) - 3.0,
+                    Ordering::Release,
+                );
             }
-            let world = self.world.clone();
-            self.entities
-                .clone()
-                .write()
-                .render_tick(&world, renderer, focused, dead);
+            let schedule = entities.schedule.clone();
+            schedule.write().run(&mut entities.world);
         }
     }
 
+    /*
     pub fn remove(&mut self, renderer: &mut render::Renderer) {
         let world = self.world.clone();
-        self.entities
-            .clone()
-            .write()
-            .remove_all_entities(&world, renderer);
+        let entities = self.entities.read();
+        let cleanup_manager = entities.world.get_resource::<CleanupManager>().unwrap();
+        cleanup_manager.cleanup_all();
         if let Some(sun_model) = self.sun_model.write().as_mut() {
             sun_model.remove(renderer);
         }
         self.target_info.clone().write().clear(renderer);
-        EntityType::deinit();
-    }
+    }*/
 
-    fn update_time(&self, renderer: &mut render::Renderer, delta: f64) {
+    fn update_time(&self, renderer: Arc<render::Renderer>, delta: f64) {
         if self.world_data.clone().read().tick_time {
             self.world_data.clone().write().world_time_target += delta / 3.0;
             let time = self.world_data.clone().read().world_time_target;
@@ -1084,7 +1149,7 @@ impl Server {
             let time = self.world_data.clone().read().world_time_target;
             self.world_data.clone().write().world_time = time;
         }
-        renderer.sky_offset = self.calculate_sky_offset();
+        renderer.light_data.lock().sky_offset = self.calculate_sky_offset();
     }
 
     fn calculate_sky_offset(&self) -> f32 {
@@ -1112,41 +1177,45 @@ impl Server {
     }
 
     pub fn minecraft_tick(&self, game: &mut Game) {
-        if let Some(player) = *self.player.clone().write() {
-            let movement = self
-                .entities
-                .clone()
-                .write()
-                .get_component_mut(player, self.player_movement)
-                .unwrap(); // TODO: This panicked - check why (none - unwrap)!
-            let on_ground = self
-                .entities
-                .clone()
-                .read()
-                .get_component(player, self.gravity)
-                .map_or(false, |v| v.on_ground);
-            let position = self
-                .entities
-                .clone()
-                .read()
-                .get_component(player, self.target_position)
-                .unwrap();
-            let rotation = self
-                .entities
-                .clone()
-                .read()
-                .get_component(player, self.rotation)
-                .unwrap();
+        if let Some(player) = *self.player.read() {
+            let on_ground = {
+                let entities = self.entities.clone();
+                let mut entities = entities.write();
+                let mut movement = entities
+                    .world
+                    .entity_mut(player.1)
+                    .get_mut::<PlayerMovement>()
+                    .unwrap();
+                // Force the server to know when touched the ground
+                // otherwise if it happens between ticks the server
+                // will think we are flying.
+                if movement.did_touch_ground {
+                    movement.did_touch_ground = false;
+                    Some(true)
+                } else {
+                    None
+                }
+            }
+            .unwrap_or_else(|| {
+                self.entities
+                    .read()
+                    .world
+                    .entity(player.1)
+                    .get::<Gravity>()
+                    .map_or(false, |v| v.on_ground)
+            });
+            let entities = self.entities.read();
 
-            // Force the server to know when touched the ground
-            // otherwise if it happens between ticks the server
-            // will think we are flying.
-            let on_ground = if movement.did_touch_ground {
-                movement.did_touch_ground = false;
-                true
-            } else {
-                on_ground
-            };
+            let position = entities
+                .world
+                .entity(player.1)
+                .get::<TargetPosition>()
+                .unwrap();
+            let rotation = entities
+                .world
+                .entity(player.1)
+                .get::<crate::entity::Rotation>()
+                .unwrap();
 
             // Sync our position to the server
             // Use the smaller packets when possible
@@ -1162,49 +1231,119 @@ impl Server {
         }
         if !game.focused {
             if self.block_break_info.lock().pressed {
-                self.abort_breaking();
+                self.abort_breaking(true);
             }
             return;
         }
         let break_delay = self.block_break_info.lock().delay;
         if break_delay > 0 {
-            self.block_break_info.lock().delay -= 1;
+            if !self.reeval_target_block() {
+                self.block_break_info.lock().delay -= 1;
+            }
         } else if self.block_break_info.lock().active {
-            if self.block_break_info.lock().progress >= 1.0 {
-                let face_idx = self.block_break_info.lock().break_face.index() as u8;
-                packet::send_digging(
-                    self.conn.clone().write().as_mut().unwrap(),
-                    self.mapped_protocol_version,
-                    DigType::StopDestroyBlock,
-                    self.block_break_info.lock().break_position,
-                    face_idx,
-                )
-                .unwrap();
-                self.block_break_info.lock().active = false;
-                self.block_break_info.lock().delay = 5;
-            } else {
-                packet::send_arm_swing(
-                    self.conn.clone().write().as_mut().unwrap(),
-                    self.mapped_protocol_version,
-                    Hand::MainHand,
-                )
-                .unwrap();
-                self.block_break_info.lock().progress += 0.1; // TODO: Make this value meaningful
+            if !self.reeval_target_block() {
+                if self.block_break_info.lock().progress >= 1.0 {
+                    let face_idx = self.block_break_info.lock().break_face.index() as u8;
+                    packet::send_digging(
+                        self.conn.clone().write().as_mut().unwrap(),
+                        self.mapped_protocol_version,
+                        DigType::StopDestroyBlock,
+                        self.block_break_info.lock().break_position,
+                        face_idx,
+                    )
+                    .unwrap();
+                    self.block_break_info.lock().active = false;
+                    self.block_break_info.lock().delay = 5;
+                    if let Some(break_id) = self.block_break_info.lock().effect_id.take() {
+                        self.entities.clone().write().world.despawn(break_id);
+                    }
+                } else {
+                    packet::send_arm_swing(
+                        self.conn.clone().write().as_mut().unwrap(),
+                        self.mapped_protocol_version,
+                        Hand::MainHand,
+                    )
+                    .unwrap();
+                    self.block_break_info.lock().progress += 0.1; // TODO: Make this value meaningful
+                    let anim_ent = self.block_break_info.lock().effect_id.unwrap();
+                    let entities = self.entities.clone();
+                    let mut entities = entities.write();
+                    let mut anim = entities.world.get_entity_mut(anim_ent).unwrap();
+                    let effect = anim.get_mut::<BlockBreakEffect>();
+                    if let Some(mut effect) = effect {
+                        effect.update_ratio(self.block_break_info.lock().progress);
+                    }
+                }
             }
         } else if self.block_break_info.lock().pressed {
             self.on_left_click();
         }
     }
 
+    fn reeval_target_block(&self) -> bool {
+        if let Some((pos, _, face, _)) = target::trace_ray(
+            &self.world.clone(),
+            4.0,
+            self.renderer.camera.lock().pos.to_vec(),
+            self.renderer.view_vector.lock().cast().unwrap(),
+            target::test_block,
+        ) {
+            let break_pos = self.block_break_info.lock().break_position;
+            let break_face = self.block_break_info.lock().break_face;
+            if pos != break_pos || face != break_face {
+                packet::send_digging(
+                    self.conn.clone().write().as_mut().unwrap(),
+                    self.mapped_protocol_version,
+                    DigType::AbortDestroyBlock,
+                    break_pos,
+                    break_face.index() as u8,
+                )
+                .unwrap();
+                packet::send_digging(
+                    self.conn.clone().write().as_mut().unwrap(),
+                    self.mapped_protocol_version,
+                    DigType::StartDestroyBlock,
+                    pos,
+                    face.index() as u8,
+                )
+                .unwrap();
+                self.block_break_info.lock().break_position = pos;
+                self.block_break_info.lock().break_face = face;
+                self.block_break_info.lock().progress = 0.0;
+                self.block_break_info.lock().hardness = 1.0; // TODO: Get actual hardness values depending on blocktype and version and tool in hands
+                if let Some(break_id) = self.block_break_info.lock().effect_id.take() {
+                    self.entities.clone().write().world.despawn(break_id);
+                }
+
+                let entities = self.entities.clone();
+                let mut entities = entities.write();
+                let mut entity = entities.world.spawn();
+                entity.insert(BlockEffectData {
+                    position: Vector3::new(pos.x as f64, pos.y as f64, pos.z as f64),
+                    status: -1,
+                });
+                let entity = entity.id();
+                ParticleType::BlockBreak.create_particle(&mut entities, entity);
+                self.block_break_info.lock().effect_id.replace(entity);
+                return true;
+            }
+            return false;
+        }
+        self.abort_breaking(false);
+        true
+    }
+
     pub fn key_press(&self, down: bool, key: Actionkey, focused: &mut bool) -> bool {
         if *focused || key == Actionkey::OpenInv || key == Actionkey::ToggleChat {
             let mut state_changed = false;
             if let Some(player) = *self.player.clone().write() {
-                if let Some(movement) = self
+                if let Some(mut movement) = self
                     .entities
                     .clone()
                     .write()
-                    .get_component_mut(player, self.player_movement)
+                    .world
+                    .entity_mut(player.1)
+                    .get_mut::<PlayerMovement>()
                 {
                     state_changed = movement.pressed_keys.get(&key).map_or(false, |v| *v) != down;
                     movement.pressed_keys.insert(key, down);
@@ -1264,9 +1403,10 @@ impl Server {
             let world = self.world.clone();
             let gamemode = *self
                 .entities
-                .clone()
-                .write()
-                .get_component(*self.player.clone().read().as_ref().unwrap(), self.gamemode)
+                .read()
+                .world
+                .entity(self.player.clone().read().as_ref().unwrap().1)
+                .get::<GameMode>()
                 .unwrap();
             if gamemode.can_interact_with_world() && self.block_break_info.lock().delay == 0 {
                 self.block_break_info.lock().pressed = true;
@@ -1274,8 +1414,8 @@ impl Server {
                 if let Some((pos, _, face, _)) = target::trace_ray(
                     &world,
                     4.0,
-                    self.renderer.read().camera.pos.to_vec(),
-                    self.renderer.read().view_vector.cast().unwrap(),
+                    self.renderer.camera.lock().pos.to_vec(),
+                    self.renderer.view_vector.lock().cast().unwrap(),
                     target::test_block,
                 ) {
                     packet::send_digging(
@@ -1291,18 +1431,35 @@ impl Server {
                     self.block_break_info.lock().progress = 0.0;
                     self.block_break_info.lock().hardness = 1.0; // TODO: Get actual hardness values depending on blocktype and version and tool in hands
                     self.block_break_info.lock().active = true;
+                    if let Some(break_id) = self.block_break_info.lock().effect_id.take() {
+                        self.entities.clone().write().world.despawn(break_id);
+                    }
+
+                    let entities = self.entities.clone();
+                    let mut entities = entities.write();
+                    let mut entity = entities.world.spawn();
+                    entity.insert(BlockEffectData {
+                        position: Vector3::new(pos.x as f64, pos.y as f64, pos.z as f64),
+                        status: -1,
+                    });
+                    let entity = entity.id();
+                    ParticleType::BlockBreak.create_particle(&mut entities, entity);
+                    self.block_break_info.lock().effect_id.replace(entity);
                 }
             }
         }
     }
 
     pub fn on_release_left_click(&self) {
-        self.abort_breaking();
+        self.abort_breaking(true);
     }
 
-    pub fn abort_breaking(&self) {
-        if self.block_break_info.lock().pressed {
+    pub fn abort_breaking(&self, unpress: bool) {
+        if unpress && self.block_break_info.lock().pressed {
             self.block_break_info.lock().pressed = false;
+        }
+        if let Some(break_id) = self.block_break_info.lock().effect_id.take() {
+            self.entities.clone().write().world.despawn(break_id);
         }
         // TODO: Call this on hand switching (hotbar scrolling), but let pressed as it is!
         if self.block_break_info.lock().active {
@@ -1326,17 +1483,18 @@ impl Server {
             let world = self.world.clone();
             let gamemode = *self
                 .entities
-                .clone()
-                .write()
-                .get_component(*self.player.clone().read().as_ref().unwrap(), self.gamemode)
+                .read()
+                .world
+                .entity(self.player.clone().read().as_ref().unwrap().1)
+                .get::<GameMode>()
                 .unwrap();
             if gamemode.can_interact_with_world() {
                 // TODO: Check this
                 if let Some((pos, _, face, at)) = target::trace_ray(
                     &world,
                     4.0,
-                    self.renderer.read().camera.pos.to_vec(),
-                    self.renderer.read().view_vector.cast().unwrap(),
+                    self.renderer.camera.lock().pos.to_vec(),
+                    self.renderer.view_vector.lock().cast().unwrap(),
                     target::test_block,
                 ) {
                     let hud_context = self.hud_context.clone();
@@ -1382,8 +1540,7 @@ impl Server {
                 return;
             }
         }
-        self.disconnect(Some(Component::Text(TextComponent {
-            // TODO: Test this!
+        self.disconnect(Some(Component::new(format::ComponentType::Text {
             text: "Already disconnected!".to_string(),
             modifier: Default::default(),
         })));
@@ -1523,12 +1680,12 @@ impl Server {
     }
 
     fn on_set_slot(&self, inventory_id: i16, slot: i16, item: Option<Stack>) {
-        println!(
+        /*println!(
             "set item {:?} to slot {} to inv {}",
             item.as_ref(),
             slot,
             inventory_id
-        );
+        );*/
         let top_inventory = self.inventory_context.clone();
         let inventory = if inventory_id == -1 || inventory_id == 0 {
             top_inventory.read().player_inventory.clone() // TODO: This caused a race condition, check why!
@@ -1568,11 +1725,12 @@ impl Server {
         let gamemode = GameMode::from_int((gamemode & 0x7) as i32);
         let player = entity::player::create_local(&mut self.entities.clone().write());
         if let Some(info) = self.players.clone().read().get(&self.uuid) {
-            let model = self
-                .entities
-                .clone()
-                .write()
-                .get_component_mut_direct::<entity::player::PlayerModel>(player)
+            let entities = self.entities.clone();
+            let mut entities = entities.write();
+            let mut model = entities
+                .world
+                .entity_mut(player)
+                .get_mut::<PlayerModel>()
                 .unwrap();
             model.set_skin(info.skin_url.clone());
         }
@@ -1581,17 +1739,21 @@ impl Server {
             .entities
             .clone()
             .write()
-            .get_component_mut(player, self.gamemode)
+            .world
+            .entity_mut(player)
+            .get_mut::<GameMode>()
             .unwrap() = gamemode;
         self.entities
             .clone()
             .write()
-            .get_component_mut(player, self.player_movement)
+            .world
+            .entity_mut(player)
+            .get_mut::<PlayerMovement>()
             .unwrap()
             .flying = gamemode.can_fly();
 
         self.entity_map.clone().write().insert(entity_id, player);
-        self.player.clone().write().replace(player);
+        self.player.clone().write().replace((entity_id, player));
 
         // Let the server know who we are
         let brand = plugin_messages::Brand {
@@ -1613,31 +1775,40 @@ impl Server {
     }
 
     fn on_respawn(&self, respawn: mapped_packet::play::clientbound::Respawn) {
+        for entity in &*self.entity_map.clone().write() {
+            if self.entities.read().world.get_entity(*entity.1).is_some() {
+                self.entities.clone().write().world.despawn(*entity.1);
+            }
+        }
+
+        let entity_id = self.player.read().unwrap().0;
+        let local_player = create_local(&mut *self.entities.clone().write());
+        *self.player.clone().write() = Some((entity_id, local_player));
         let gamemode = GameMode::from_int((respawn.gamemode & 0x7) as i32);
 
         if let Some(player) = *self.player.clone().write() {
             self.hud_context.clone().write().update_game_mode(gamemode);
+
             *self
                 .entities
                 .clone()
                 .write()
-                .get_component_mut(player, self.gamemode)
+                .world
+                .entity_mut(player.1)
+                .get_mut::<GameMode>()
                 .unwrap() = gamemode;
             self.entities
                 .clone()
                 .write()
-                .get_component_mut(player, self.player_movement)
+                .world
+                .entity_mut(player.1)
+                .get_mut::<PlayerMovement>()
                 .unwrap()
                 .flying = gamemode.can_fly();
         }
-        self.entities
-            .clone()
-            .write()
-            .remove_all_entities_gracefully();
-        *self.player.clone().write() = Some(create_local(&mut *self.entities.clone().write()));
-        if *self.dead.read() {
-            *self.dead.write() = false;
-            *self.just_died.write() = false;
+        if self.dead.load(Ordering::Acquire) {
+            self.dead.store(false, Ordering::Release);
+            self.just_died.store(false, Ordering::Release);
             self.hud_context
                 .clone()
                 .write()
@@ -1649,6 +1820,10 @@ impl Server {
             // self.hud_context.clone().write().update_breath(-1); // TODO: Fix this!
             self.screen_sys.pop_screen();
         }
+        self.entity_map
+            .clone()
+            .write()
+            .insert(entity_id, local_player);
     }
 
     // TODO: make use of "on_disconnect"
@@ -1678,12 +1853,16 @@ impl Server {
                     .entities
                     .clone()
                     .write()
-                    .get_component_mut(player, self.gamemode)
+                    .world
+                    .entity_mut(player.1)
+                    .get_mut::<GameMode>()
                     .unwrap() = gamemode;
                 self.entities
                     .clone()
                     .write()
-                    .get_component_mut(player, self.player_movement)
+                    .world
+                    .entity_mut(player.1)
+                    .get_mut::<PlayerMovement>()
                     .unwrap()
                     .flying = gamemode.can_fly();
             }
@@ -1714,7 +1893,7 @@ impl Server {
     fn on_entity_destroy(&self, entity_destroy: mapped_packet::play::clientbound::EntityDestroy) {
         for id in entity_destroy.entity_ids {
             if let Some(entity) = self.entity_map.clone().write().remove(&id) {
-                self.entities.clone().write().remove_entity(entity);
+                self.entities.clone().write().world.despawn(entity);
             }
         }
     }
@@ -1731,21 +1910,25 @@ impl Server {
     ) {
         use std::f64::consts::PI;
         if let Some(entity) = self.entity_map.clone().read().get(&entity_id) {
-            let target_position = self
-                .entities
-                .clone()
-                .write()
-                .get_component_mut(*entity, self.target_position)
+            {
+                let entities = self.entities.clone();
+                let mut entities = entities.write();
+                let mut target_position = entities
+                    .world
+                    .entity_mut(*entity)
+                    .get_mut::<TargetPosition>()
+                    .unwrap();
+                target_position.position.x = x;
+                target_position.position.y = y;
+                target_position.position.z = z;
+            }
+            let entities = self.entities.clone();
+            let mut entities = entities.write();
+            let mut target_rotation = entities
+                .world
+                .entity_mut(*entity)
+                .get_mut::<TargetRotation>()
                 .unwrap();
-            let target_rotation = self
-                .entities
-                .clone()
-                .write()
-                .get_component_mut(*entity, self.target_rotation)
-                .unwrap();
-            target_position.position.x = x;
-            target_position.position.y = y;
-            target_position.position.z = z;
             target_rotation.yaw = -(yaw / 256.0) * PI * 2.0;
             target_rotation.pitch = -(pitch / 256.0) * PI * 2.0;
         }
@@ -1753,11 +1936,12 @@ impl Server {
 
     fn on_entity_move(&self, entity_move: mapped_packet::play::clientbound::EntityMove) {
         if let Some(entity) = self.entity_map.clone().read().get(&entity_move.entity_id) {
-            let position = self
-                .entities
-                .clone()
-                .write()
-                .get_component_mut(*entity, self.target_position)
+            let entities = self.entities.clone();
+            let mut entities = entities.write();
+            let mut position = entities
+                .world
+                .entity_mut(*entity)
+                .get_mut::<TargetPosition>()
                 .unwrap();
             position.position.x += entity_move.delta_x;
             position.position.y += entity_move.delta_y;
@@ -1768,11 +1952,12 @@ impl Server {
     fn on_entity_look(&self, entity_id: i32, yaw: f64, pitch: f64) {
         use std::f64::consts::PI;
         if let Some(entity) = self.entity_map.clone().read().get(&entity_id) {
-            let rotation = self
-                .entities
-                .clone()
-                .write()
-                .get_component_mut(*entity, self.target_rotation)
+            let entities = self.entities.clone();
+            let mut entities = entities.write();
+            let mut rotation = entities
+                .world
+                .entity_mut(*entity)
+                .get_mut::<TargetRotation>()
                 .unwrap();
             rotation.yaw = -(yaw / 256.0) * PI * 2.0;
             rotation.pitch = -(pitch / 256.0) * PI * 2.0;
@@ -1790,21 +1975,25 @@ impl Server {
     ) {
         use std::f64::consts::PI;
         if let Some(entity) = self.entity_map.clone().read().get(&entity_id) {
-            let position = self
-                .entities
-                .clone()
-                .write()
-                .get_component_mut(*entity, self.target_position)
+            {
+                let entities = self.entities.clone();
+                let mut entities = entities.write();
+                let mut position = entities
+                    .world
+                    .entity_mut(*entity)
+                    .get_mut::<TargetPosition>()
+                    .unwrap();
+                position.position.x += delta_x;
+                position.position.y += delta_y;
+                position.position.z += delta_z;
+            }
+            let entities = self.entities.clone();
+            let mut entities = entities.write();
+            let mut rotation = entities
+                .world
+                .entity_mut(*entity)
+                .get_mut::<TargetRotation>()
                 .unwrap();
-            let rotation = self
-                .entities
-                .clone()
-                .write()
-                .get_component_mut(*entity, self.target_rotation)
-                .unwrap();
-            position.position.x += delta_x;
-            position.position.y += delta_y;
-            position.position.z += delta_z;
             rotation.yaw = -(yaw / 256.0) * PI * 2.0;
             rotation.pitch = -(pitch / 256.0) * PI * 2.0;
         }
@@ -1822,7 +2011,7 @@ impl Server {
     ) {
         use std::f64::consts::PI;
         if let Some(entity) = self.entity_map.clone().write().remove(&entity_id) {
-            self.entities.clone().write().remove_entity(entity);
+            self.entities.clone().write().world.despawn(entity);
         }
         let entity = entity::player::create_remote(
             &mut self.entities.clone().write(),
@@ -1832,46 +2021,52 @@ impl Server {
                 .get(&uuid)
                 .map_or("MISSING", |v| &v.name),
         );
-        let position = self
-            .entities
-            .clone()
-            .write()
-            .get_component_mut(entity, self.position)
-            .unwrap();
-        let target_position = self
-            .entities
-            .clone()
-            .write()
-            .get_component_mut(entity, self.target_position)
-            .unwrap();
-        let rotation = self
-            .entities
-            .clone()
-            .write()
-            .get_component_mut(entity, self.rotation)
-            .unwrap();
-        let target_rotation = self
-            .entities
-            .clone()
-            .write()
-            .get_component_mut(entity, self.target_rotation)
-            .unwrap();
-        position.position.x = x;
-        position.position.y = y;
-        position.position.z = z;
-        target_position.position.x = x;
-        target_position.position.y = y;
-        target_position.position.z = z;
-        rotation.yaw = -(yaw / 256.0) * PI * 2.0;
-        rotation.pitch = -(pitch / 256.0) * PI * 2.0;
-        target_rotation.yaw = rotation.yaw;
-        target_rotation.pitch = rotation.pitch;
+        let entities = self.entities.clone();
+        let mut entities = entities.write();
+        {
+            let mut position = entities
+                .world
+                .entity_mut(entity)
+                .get_mut::<crate::entity::Position>()
+                .unwrap();
+            position.position.x = x;
+            position.position.y = y;
+            position.position.z = z;
+        }
+        {
+            let mut target_position = entities
+                .world
+                .entity_mut(entity)
+                .get_mut::<TargetPosition>()
+                .unwrap();
+            target_position.position.x = x;
+            target_position.position.y = y;
+            target_position.position.z = z;
+        }
+        let (yaw, pitch) = {
+            let mut rotation = entities
+                .world
+                .entity_mut(entity)
+                .get_mut::<crate::entity::Rotation>()
+                .unwrap();
+            rotation.yaw = -(yaw / 256.0) * PI * 2.0;
+            rotation.pitch = -(pitch / 256.0) * PI * 2.0;
+            (rotation.yaw, rotation.pitch)
+        };
+        {
+            let mut target_rotation = entities
+                .world
+                .entity_mut(entity)
+                .get_mut::<TargetRotation>()
+                .unwrap();
+            target_rotation.yaw = yaw;
+            target_rotation.pitch = pitch;
+        }
         if let Some(info) = self.players.clone().read().get(&uuid) {
-            let model = self
-                .entities
-                .clone()
-                .write()
-                .get_component_mut_direct::<entity::player::PlayerModel>(entity)
+            let mut model = entities
+                .world
+                .entity_mut(entity)
+                .get_mut::<PlayerModel>()
                 .unwrap();
             model.set_skin(info.skin_url.clone());
         }
@@ -1881,58 +2076,62 @@ impl Server {
     fn on_teleport_player(&self, teleport: mapped_packet::play::clientbound::TeleportPlayer) {
         use std::f64::consts::PI;
         if let Some(player) = *self.player.clone().write() {
-            let position = self
-                .entities
-                .clone()
-                .write()
-                .get_component_mut(player, self.target_position)
-                .unwrap();
-            let rotation = self
-                .entities
-                .clone()
-                .write()
-                .get_component_mut(player, self.rotation)
-                .unwrap();
-            let velocity = self
-                .entities
-                .clone()
-                .write()
-                .get_component_mut(player, self.velocity)
-                .unwrap();
-
             let flags = teleport.flags.unwrap_or(0);
-            position.position.x = calculate_relative_teleport(
-                TeleportFlag::RelX,
-                flags,
-                position.position.x,
-                teleport.x,
-            );
-            position.position.y = calculate_relative_teleport(
-                TeleportFlag::RelY,
-                flags,
-                position.position.y,
-                teleport.y,
-            );
-            position.position.z = calculate_relative_teleport(
-                TeleportFlag::RelZ,
-                flags,
-                position.position.z,
-                teleport.z,
-            );
-            rotation.yaw = calculate_relative_teleport(
-                TeleportFlag::RelYaw,
-                flags,
-                rotation.yaw,
-                -teleport.yaw as f64 * (PI / 180.0),
-            );
+            let entities = self.entities.clone();
+            let mut entities = entities.write();
 
-            rotation.pitch = -((calculate_relative_teleport(
-                TeleportFlag::RelPitch,
-                flags,
-                (-rotation.pitch) * (180.0 / PI) + 180.0,
-                teleport.pitch as f64,
-            ) - 180.0)
-                * (PI / 180.0));
+            {
+                let mut position = entities
+                    .world
+                    .entity_mut(player.1)
+                    .get_mut::<TargetPosition>()
+                    .unwrap();
+                position.position.x = calculate_relative_teleport(
+                    TeleportFlag::RelX,
+                    flags,
+                    position.position.x,
+                    teleport.x,
+                );
+                position.position.y = calculate_relative_teleport(
+                    TeleportFlag::RelY,
+                    flags,
+                    position.position.y,
+                    teleport.y,
+                );
+                position.position.z = calculate_relative_teleport(
+                    TeleportFlag::RelZ,
+                    flags,
+                    position.position.z,
+                    teleport.z,
+                );
+            }
+            {
+                let mut rotation = entities
+                    .world
+                    .entity_mut(player.1)
+                    .get_mut::<crate::entity::Rotation>()
+                    .unwrap();
+                rotation.yaw = calculate_relative_teleport(
+                    TeleportFlag::RelYaw,
+                    flags,
+                    rotation.yaw,
+                    -teleport.yaw as f64 * (PI / 180.0),
+                );
+
+                rotation.pitch = -((calculate_relative_teleport(
+                    TeleportFlag::RelPitch,
+                    flags,
+                    (-rotation.pitch) * (180.0 / PI) + 180.0,
+                    teleport.pitch as f64,
+                ) - 180.0)
+                    * (PI / 180.0));
+            }
+
+            let mut velocity = entities
+                .world
+                .entity_mut(player.1)
+                .get_mut::<crate::entity::Velocity>()
+                .unwrap();
 
             if (flags & (TeleportFlag::RelX as u8)) == 0 {
                 velocity.velocity.x = 0.0;
@@ -1978,16 +2177,16 @@ impl Server {
                     //8 => // Gateway
                     9 => {
                         // Sign
-                        let line1 = format::Component::from_string(
+                        let line1 = format::Component::from_str(
                             nbt.1.get("Text1").unwrap().as_str().unwrap(),
                         );
-                        let line2 = format::Component::from_string(
+                        let line2 = format::Component::from_str(
                             nbt.1.get("Text2").unwrap().as_str().unwrap(),
                         );
-                        let line3 = format::Component::from_string(
+                        let line3 = format::Component::from_str(
                             nbt.1.get("Text3").unwrap().as_str().unwrap(),
                         );
-                        let line4 = format::Component::from_string(
+                        let line4 = format::Component::from_str(
                             nbt.1.get("Text4").unwrap().as_str().unwrap(),
                         );
                         self.world.clone().add_block_entity_action(
@@ -2020,10 +2219,10 @@ impl Server {
     }*/
 
     fn on_sign_update(&self, mut update_sign: mapped_packet::play::clientbound::UpdateSign) {
-        format::convert_legacy(&mut update_sign.line1);
-        format::convert_legacy(&mut update_sign.line2);
-        format::convert_legacy(&mut update_sign.line3);
-        format::convert_legacy(&mut update_sign.line4);
+        update_sign.line1 = update_sign.line1.try_update_with_legacy();
+        update_sign.line2 = update_sign.line2.try_update_with_legacy();
+        update_sign.line3 = update_sign.line3.try_update_with_legacy();
+        update_sign.line4 = update_sign.line4.try_update_with_legacy();
         self.world
             .clone()
             .add_block_entity_action(world::BlockEntityAction::UpdateSignText(Box::new((
@@ -2125,13 +2324,12 @@ impl Server {
                     // This isn't an issue for other players because this packet
                     // must come before the spawn player packet.
                     if info.uuid == self.uuid {
-                        let model = self
-                            .entities
-                            .clone()
-                            .write()
-                            .get_component_mut_direct::<entity::player::PlayerModel>(
-                                self.player.clone().write().unwrap(),
-                            )
+                        let entities = self.entities.clone();
+                        let mut entities = entities.write();
+                        let mut model = entities
+                            .world
+                            .entity_mut(self.player.clone().write().unwrap().1)
+                            .get_mut::<entity::player::PlayerModel>()
                             .unwrap();
                         model.set_skin(info.skin_url.clone());
                     }
@@ -2408,8 +2606,8 @@ impl Server {
             .clone()
             .write()
             .update_health_and_food(health, food, saturation);
-        if health <= 0.0 && !*self.dead.read() {
-            *self.dead.write() = true;
+        if health <= 0.0 && !self.dead.load(Ordering::Acquire) {
+            self.dead.store(true, Ordering::Release);
             self.screen_sys.close_closable_screens();
             self.screen_sys
                 .clone()
